@@ -1,3 +1,5 @@
+--extra-index-url https://download.pytorch.org/whl/cu118
+
 # Core Deep Learning
 torch>=2.0.0
 torchvision>=0.15.0

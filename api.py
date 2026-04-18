@@ -9,6 +9,7 @@ Endpoint duy nhất: POST /predict
 Thư viện cần thiết:
     pip install fastapi uvicorn[standard] httpx
     pip install python-multipart  # nếu muốn hỗ trợ upload file ảnh trực tiếp (multipart/form-data)
+    pip install opencv-python facenet-pytorch numpy
   
 Khởi chạy:
     uvicorn api:app --host 0.0.0.0 --port 8000 --reload
@@ -63,7 +64,7 @@ else:
     MODEL_PATH: str = os.environ.get("MODEL_PATH", DEFAULT_MODEL_PATH_G2DM)
 
 DEVICE: str = os.environ.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
-IMAGE_SIZE: tuple[int, int] = (224, 224)
+IMAGE_SIZE: tuple[int, int] = (256, 256)  # kích thước ảnh đầu vào cho model (phù hợp với pipeline huấn luyện)
 CLASS_NAMES: list[str] = ["Real", "Fake"]
 
 # Danh sách Content-Type được chấp nhận khi tải ảnh
@@ -73,14 +74,133 @@ ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/bmp", "
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Transforms (chuẩn ImageNet – khớp với pipeline huấn luyện)
+# Pipeline Tiền Xử Lý (Face Crop + Letterbox Resize)
 # ──────────────────────────────────────────────────────────────────────────────
-preprocess = transforms.Compose([
-    transforms.Resize(IMAGE_SIZE),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225]),
-])
+import cv2
+import numpy as np
+from facenet_pytorch import MTCNN
+
+class DeepfakePreprocessingPipeline:
+    """
+    Pipeline tiền xử lý ảnh cho DeepFake Detection.
+    
+    Nguyên tắc cốt lõi:
+      1. Crop khuôn mặt theo đúng bounding box MTCNN + margin nhẹ.
+      2. KHÔNG ép vuông bằng cách kéo giãn hoặc replicate pixel — tránh biến dạng cằm/trán.
+      3. Resize giữ nguyên tỷ lệ gốc (aspect ratio), pad phần thừa bằng màu nền 
+         trung bình của chính ảnh đó (tự nhiên, không gây artifact).
+      4. Bảo toàn chất lượng pixel tối đa qua thuật toán nội suy phù hợp.
+    """
+
+    def __init__(self, target_size=(256, 256), margin_ratio=0.15, device='cpu'):
+        """
+        Args:
+            target_size: Kích thước đầu ra (W, H) cho model.
+            margin_ratio: Tỷ lệ margin thêm vào mỗi cạnh bounding box (0.15 = 15%).
+                          Giá trị nhỏ giữ khuôn mặt khít, vừa đủ lấy viền tóc/cằm.
+            device: 'cuda' hoặc 'cpu' cho MTCNN.
+        """
+        self.target_size = target_size
+        self.margin_ratio = margin_ratio
+        self.device = device
+        self.mtcnn = MTCNN(keep_all=False, select_largest=True, device=self.device)
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
+
+    def detect_and_crop(self, image_rgb: np.ndarray) -> np.ndarray:
+        """
+        Detect khuôn mặt lớn nhất, crop theo bounding box + margin,
+        clamp tọa độ vào ảnh gốc (KHÔNG tạo pixel giả).
+        
+        Returns:
+            Ảnh RGB đã crop, giữ nguyên tỷ lệ gốc (có thể là hình chữ nhật).
+        """
+        h, w = image_rgb.shape[:2]
+        boxes, _ = self.mtcnn.detect(image_rgb)
+
+        if boxes is None:
+            raise ValueError("Không tìm thấy khuôn mặt trong ảnh!")
+
+        x1, y1, x2, y2 = boxes[0]
+        box_w = x2 - x1
+        box_h = y2 - y1
+
+        # Thêm margin theo tỷ lệ % của mỗi chiều — giữ nguyên aspect ratio face
+        margin_w = box_w * self.margin_ratio
+        margin_h = box_h * self.margin_ratio
+
+        # Clamp vào biên ảnh gốc — KHÔNG BAO GIỜ vượt ra ngoài = KHÔNG cần pad giả
+        crop_x1 = max(0, int(x1 - margin_w))
+        crop_y1 = max(0, int(y1 - margin_h))
+        crop_x2 = min(w, int(x2 + margin_w))
+        crop_y2 = min(h, int(y2 + margin_h))
+
+        return image_rgb[crop_y1:crop_y2, crop_x1:crop_x2]
+
+    def resize_preserve_ratio(self, image: np.ndarray) -> np.ndarray:
+        """
+        Resize giữ nguyên tỷ lệ, pad phần thừa bằng màu trung bình của ảnh.
+        
+        Tại sao pad bằng mean color thay vì đen?
+          - Viền đen tạo ra cạnh sắc (edge artifact) mà model dễ nhầm là dấu hiệu ghép.
+          - Mean color hòa trộn tự nhiên không gây nhiễu cho feature extractor.
+        """
+        target_w, target_h = self.target_size
+        h, w = image.shape[:2]
+
+        scale = min(target_w / w, target_h / h)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+
+        # Chọn interpolation tối ưu cho từng trường hợp
+        if scale < 1.0:
+            interpolation = cv2.INTER_AREA      # Thu nhỏ: Area averaging giữ nét
+        else:
+            interpolation = cv2.INTER_CUBIC      # Phóng to: Cubic mượt mà
+
+        resized = cv2.resize(image, (new_w, new_h), interpolation=interpolation)
+
+        # Tính màu nền trung bình của ảnh đã resize
+        mean_color = cv2.mean(resized)[:3]
+        mean_color = tuple(int(c) for c in mean_color)
+
+        # Tạo canvas nền bằng mean color, đặt ảnh vào chính giữa
+        canvas = np.full((target_h, target_w, 3), mean_color, dtype=np.uint8)
+        y_offset = (target_h - new_h) // 2
+        x_offset = (target_w - new_w) // 2
+        canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
+
+        return canvas
+
+    def process(self, image_bytes: bytes) -> torch.Tensor:
+        """Pipeline chính: bytes ảnh → tensor chuẩn bị inference."""
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        image_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if image_bgr is None:
+            raise ValueError("Không thể decode định dạng ảnh.")
+
+        # Chuyển sang RGB một lần duy nhất ngay từ đầu
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+        # 1. Crop khuôn mặt theo bounding box MTCNN (giữ nguyên tỷ lệ, không biến dạng)
+        cropped_face = self.detect_and_crop(image_rgb)
+
+        # 2. Resize giữ tỷ lệ + pad mean color
+        processed_img = self.resize_preserve_ratio(cropped_face)
+
+        # 3. Lưu ảnh debug để kiểm tra trực quan
+        debug_path = os.path.join(os.getcwd(), "debug_processed_face.jpg")
+        cv2.imwrite(debug_path, cv2.cvtColor(processed_img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 100])
+        print(f"[API] Đã lưu ảnh debug: {debug_path} ({processed_img.shape[1]}x{processed_img.shape[0]})")
+
+        # 4. Normalize → Tensor
+        tensor = self.transform(processed_img).unsqueeze(0)
+        return tensor
+
+# Khởi tạo singleton pipeline
+preprocess_pipeline = DeepfakePreprocessingPipeline(target_size=IMAGE_SIZE, device=DEVICE)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Model singleton (load một lần duy nhất khi server khởi động)
@@ -222,7 +342,9 @@ class PredictResponse(BaseModel):
     label: int            # 0 = Real, 1 = Fake
     confidence: float     # xác suất của class được dự đoán (0–1)
     prob_real: float      # xác suất ảnh là thật
-    prob_fake: float      # xác suất ảnh là deepfake    model_type: str       # G2DMNet hoặc XceptionNet    model_file: str       # tên file model đã dùng
+    prob_fake: float      # xác suất ảnh là deepfake
+    model_type: str       # G2DMNet hoặc XceptionNet
+    model_file: str       # tên file model đã dùng
     device: str           # "cuda" hoặc "cpu"
 
 
@@ -304,11 +426,11 @@ async def predict(
 
     # ── 2. Decode & tiền xử lý ───────────────────────────────────────────────
     try:
-        image = Image.open(io.BytesIO(image_content)).convert("RGB")
+        tensor = preprocess_pipeline.process(image_content).to(DEVICE)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Không thể đọc ảnh: {exc}")
-
-    tensor = preprocess(image).unsqueeze(0).to(DEVICE)  # (1, 3, 224, 224)
+        raise HTTPException(status_code=500, detail=f"Lỗi tiền xử lý ảnh: {exc}")
 
     # ── 3. Inference ─────────────────────────────────────────────────────────
     try:
