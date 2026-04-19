@@ -84,41 +84,34 @@ class DeepfakePreprocessingPipeline:
     """
     Pipeline tiền xử lý ảnh cho DeepFake Detection.
     
-    Nguyên tắc cốt lõi:
-      1. Crop khuôn mặt theo đúng bounding box MTCNN + margin nhẹ.
-      2. KHÔNG ép vuông bằng cách kéo giãn hoặc replicate pixel — tránh biến dạng cằm/trán.
-      3. Resize giữ nguyên tỷ lệ gốc (aspect ratio), pad phần thừa bằng màu nền 
-         trung bình của chính ảnh đó (tự nhiên, không gây artifact).
-      4. Bảo toàn chất lượng pixel tối đa qua thuật toán nội suy phù hợp.
+    Chiến lược crop chính xác:
+      1. MTCNN detect face → lấy bounding box + 5 facial landmarks.
+      2. Dùng landmarks (2 mắt, mũi) để tính tâm khuôn mặt và khoảng cách mắt-mắt.
+         Từ đó xác định vùng crop ĐÚNG khuôn mặt (trán → cằm, má trái → má phải).
+      3. Crop vuông, resize thẳng 256×256, KHÔNG pad, KHÔNG viền.
+      4. 100% pixel trong output là pixel GỐC từ ảnh ban đầu.
     """
 
-    def __init__(self, target_size=(256, 256), margin_ratio=0.15, device='cpu'):
-        """
-        Args:
-            target_size: Kích thước đầu ra (W, H) cho model.
-            margin_ratio: Tỷ lệ margin thêm vào mỗi cạnh bounding box (0.15 = 15%).
-                          Giá trị nhỏ giữ khuôn mặt khít, vừa đủ lấy viền tóc/cằm.
-            device: 'cuda' hoặc 'cpu' cho MTCNN.
-        """
+    def __init__(self, target_size=(256, 256), device='cpu'):
         self.target_size = target_size
-        self.margin_ratio = margin_ratio
         self.device = device
+        # landmarks=True để MTCNN trả về tọa độ 5 điểm (mắt trái, mắt phải, mũi, 2 mép miệng)
         self.mtcnn = MTCNN(keep_all=False, select_largest=True, device=self.device)
         self.transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         ])
 
-    def detect_and_crop(self, image_rgb: np.ndarray) -> np.ndarray:
+    def detect_and_crop_square(self, image_rgb: np.ndarray) -> np.ndarray:
         """
-        Detect khuôn mặt lớn nhất, crop theo bounding box + margin,
-        clamp tọa độ vào ảnh gốc (KHÔNG tạo pixel giả).
+        Detect face bằng MTCNN, dùng bounding box gốc (đã khít mặt) để crop.
         
-        Returns:
-            Ảnh RGB đã crop, giữ nguyên tỷ lệ gốc (có thể là hình chữ nhật).
+        MTCNN bounding box đã bao trọn khuôn mặt từ trán→cằm, má→má.
+        Ta KHÔNG thêm margin ngoài nữa — chỉ crop đúng box rồi ép vuông
+        bằng cách THU HẸP cạnh dài (cắt bớt) thay vì mở rộng cạnh ngắn (thêm nền).
         """
-        h, w = image_rgb.shape[:2]
-        boxes, _ = self.mtcnn.detect(image_rgb)
+        img_h, img_w = image_rgb.shape[:2]
+        boxes, probs, landmarks = self.mtcnn.detect(image_rgb, landmarks=True)
 
         if boxes is None:
             raise ValueError("Không tìm thấy khuôn mặt trong ảnh!")
@@ -126,76 +119,70 @@ class DeepfakePreprocessingPipeline:
         x1, y1, x2, y2 = boxes[0]
         box_w = x2 - x1
         box_h = y2 - y1
+        
+        # Tâm bounding box
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        
+        # Dịch tâm xuống dưới 5% chiều cao box để lấy thêm phần cằm
+        # (vì ép vuông bằng min cắt đều 2 đầu → mất cằm nhiều hơn trán)
+        cy += box_h * 0.05
 
-        # Thêm margin theo tỷ lệ % của mỗi chiều — giữ nguyên aspect ratio face
-        margin_w = box_w * self.margin_ratio
-        margin_h = box_h * self.margin_ratio
+        # Ép vuông bằng cạnh NGẮN nhất (= thu hẹp cạnh dài, cắt bớt vùng thừa)
+        # Đây là điểm mấu chốt: dùng min thay vì max → không bao giờ lấy thêm nền
+        side = min(box_w, box_h)
+        half = side / 2
 
-        # Clamp vào biên ảnh gốc — KHÔNG BAO GIỜ vượt ra ngoài = KHÔNG cần pad giả
-        crop_x1 = max(0, int(x1 - margin_w))
-        crop_y1 = max(0, int(y1 - margin_h))
-        crop_x2 = min(w, int(x2 + margin_w))
-        crop_y2 = min(h, int(y2 + margin_h))
+        # Tọa độ crop vuông, đặt tại tâm bounding box
+        crop_x1 = int(cx - half)
+        crop_y1 = int(cy - half)
+        crop_x2 = int(cx + half)
+        crop_y2 = int(cy + half)
+        crop_side = crop_x2 - crop_x1
+
+        # Shift khung vào trong ảnh nếu bị tràn biên
+        if crop_x1 < 0:
+            crop_x2 = min(crop_side, img_w)
+            crop_x1 = 0
+        if crop_y1 < 0:
+            crop_y2 = min(crop_side, img_h)
+            crop_y1 = 0
+        if crop_x2 > img_w:
+            crop_x1 = max(0, img_w - crop_side)
+            crop_x2 = img_w
+        if crop_y2 > img_h:
+            crop_y1 = max(0, img_h - crop_side)
+            crop_y2 = img_h
 
         return image_rgb[crop_y1:crop_y2, crop_x1:crop_x2]
 
-    def resize_preserve_ratio(self, image: np.ndarray) -> np.ndarray:
-        """
-        Resize giữ nguyên tỷ lệ, pad phần thừa bằng màu trung bình của ảnh.
-        
-        Tại sao pad bằng mean color thay vì đen?
-          - Viền đen tạo ra cạnh sắc (edge artifact) mà model dễ nhầm là dấu hiệu ghép.
-          - Mean color hòa trộn tự nhiên không gây nhiễu cho feature extractor.
-        """
-        target_w, target_h = self.target_size
-        h, w = image.shape[:2]
-
-        scale = min(target_w / w, target_h / h)
-        new_w = int(w * scale)
-        new_h = int(h * scale)
-
-        # Chọn interpolation tối ưu cho từng trường hợp
-        if scale < 1.0:
-            interpolation = cv2.INTER_AREA      # Thu nhỏ: Area averaging giữ nét
-        else:
-            interpolation = cv2.INTER_CUBIC      # Phóng to: Cubic mượt mà
-
-        resized = cv2.resize(image, (new_w, new_h), interpolation=interpolation)
-
-        # Tính màu nền trung bình của ảnh đã resize
-        mean_color = cv2.mean(resized)[:3]
-        mean_color = tuple(int(c) for c in mean_color)
-
-        # Tạo canvas nền bằng mean color, đặt ảnh vào chính giữa
-        canvas = np.full((target_h, target_w, 3), mean_color, dtype=np.uint8)
-        y_offset = (target_h - new_h) // 2
-        x_offset = (target_w - new_w) // 2
-        canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
-
-        return canvas
-
     def process(self, image_bytes: bytes) -> torch.Tensor:
-        """Pipeline chính: bytes ảnh → tensor chuẩn bị inference."""
+        """Pipeline chính: bytes ảnh → tensor 256×256 sẵn sàng inference."""
         nparr = np.frombuffer(image_bytes, np.uint8)
         image_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if image_bgr is None:
             raise ValueError("Không thể decode định dạng ảnh.")
 
-        # Chuyển sang RGB một lần duy nhất ngay từ đầu
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 
-        # 1. Crop khuôn mặt theo bounding box MTCNN (giữ nguyên tỷ lệ, không biến dạng)
-        cropped_face = self.detect_and_crop(image_rgb)
+        # 1. Crop face vuông — chỉ lấy khuôn mặt, không lấy nền
+        cropped_face = self.detect_and_crop_square(image_rgb)
 
-        # 2. Resize giữ tỷ lệ + pad mean color
-        processed_img = self.resize_preserve_ratio(cropped_face)
+        # 2. Resize thẳng về 256×256 (ảnh đã vuông → không méo)
+        h, w = cropped_face.shape[:2]
+        target_w, target_h = self.target_size
+        if h > target_h or w > target_w:
+            interpolation = cv2.INTER_AREA
+        else:
+            interpolation = cv2.INTER_CUBIC
+        processed_img = cv2.resize(cropped_face, (target_w, target_h), interpolation=interpolation)
 
-        # 3. Lưu ảnh debug để kiểm tra trực quan
+        # 3. Lưu debug
         debug_path = os.path.join(os.getcwd(), "debug_processed_face.jpg")
         cv2.imwrite(debug_path, cv2.cvtColor(processed_img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 100])
-        print(f"[API] Đã lưu ảnh debug: {debug_path} ({processed_img.shape[1]}x{processed_img.shape[0]})")
+        print(f"[API] Debug: {debug_path} | crop {w}x{h} → {target_w}x{target_h}")
 
-        # 4. Normalize → Tensor
+        # 4. Normalize → Tensor [1, 3, 256, 256]
         tensor = self.transform(processed_img).unsqueeze(0)
         return tensor
 
