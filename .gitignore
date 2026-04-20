@@ -76,6 +76,7 @@ Thumbs.db
 *.pth
 *.ckpt
 *.pb
+model/hf_weights/
 
 # Data files
 *.csv
