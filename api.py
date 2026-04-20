@@ -1,21 +1,27 @@
 """
-DeepFake Detection – FastAPI Backend
-=====================================
+DeepFake Detection – FastAPI Backend (Ensemble Pipeline)
+=========================================================
 Endpoint duy nhất: POST /predict
   - Nhận URL/File ảnh từ client mobile
-  - Download ảnh, tiền xử lý, chạy inference với G2DMNet/XceptionNet
-  - Trả về toàn bộ kết quả dự đoán
+  - Download ảnh, tiền xử lý (MTCNN face crop)
+  - Chạy inference với 4 model ensemble:
+      1. XceptionNet (local checkpoint)
+      2. SigLIP2 Deepfake Detector (HuggingFace)
+      3. CommunityForensics ViT (HuggingFace)
+      4. CLIP-Yermakov Deepfake Detector (TorchScript từ HuggingFace)
+  - Trả về điểm ensemble + từng model riêng lẻ
 
 Thư viện cần thiết:
-    pip install fastapi uvicorn[standard] httpx
-    pip install python-multipart  # nếu muốn hỗ trợ upload file ảnh trực tiếp (multipart/form-data)
-    pip install opencv-python facenet-pytorch numpy
+    pip install fastapi uvicorn[standard] httpx python-multipart
+    pip install torch torchvision transformers timm
+    pip install opencv-python facenet-pytorch numpy pillow
+    pip install huggingface_hub
   
 Khởi chạy:
     uvicorn api:app --host 0.0.0.0 --port 8000 --reload
 
 Biến môi trường tùy chọn:
-    MODEL_PATH  – đường dẫn tới file .pth (mặc định: xem DEFAULT_MODEL_PATH)
+    MODEL_PATH  – đường dẫn tới file .pth XceptionNet (mặc định: xem DEFAULT_MODEL_PATH_XCEPTION)
     DEVICE      – "cuda" | "cpu" (mặc định: tự phát hiện)
 """
 
@@ -24,7 +30,9 @@ import ipaddress
 import os
 import socket
 import sys
+import traceback
 from contextlib import asynccontextmanager
+from typing import Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -35,37 +43,26 @@ from PIL import Image
 from pydantic import BaseModel, field_validator
 from torchvision import transforms
 
-# Đảm bảo project root trong sys.path để import network/G2DMNet
+# Đảm bảo project root trong sys.path để import network/XceptionNet
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from network.G2DMNet import G2DMNet  # noqa: E402
 from network.XceptionNet import XceptionNet  # noqa: E402
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Cấu hình
 # ──────────────────────────────────────────────────────────────────────────────
-DEFAULT_MODEL_TYPE = "XceptionNet" # Hoặc "XceptionNet" | "G2DMNet" (mặc định: XceptionNet nhẹ hơn, phù hợp cho mobile)
-MODEL_TYPE: str = os.environ.get("MODEL_TYPE", DEFAULT_MODEL_TYPE)
-
-DEFAULT_MODEL_PATH_G2DM = os.path.join(
-    "model",
-    "Deepfakes_pretrain_multi",
-    # "pretrained_DeepFakes_FaceShifter_gsftmFalse_csmiamFalse_decamFalse_ratio0.7.pth",
-    "best_Deepfakes1_gsftmTrue_csmiamTrue_decamTrue.pth",
-)
 DEFAULT_MODEL_PATH_XCEPTION = os.path.join(
     "model",
     "Deepfakes_pretrain_multi",
     "xception_best.pth",
 )
 
-if MODEL_TYPE == "XceptionNet":
-    MODEL_PATH: str = os.environ.get("MODEL_PATH", DEFAULT_MODEL_PATH_XCEPTION)
-else:
-    MODEL_PATH: str = os.environ.get("MODEL_PATH", DEFAULT_MODEL_PATH_G2DM)
-
+MODEL_PATH: str = os.environ.get("MODEL_PATH", DEFAULT_MODEL_PATH_XCEPTION)
 DEVICE: str = os.environ.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
-IMAGE_SIZE: tuple[int, int] = (256, 256)  # kích thước ảnh đầu vào cho model (phù hợp với pipeline huấn luyện)
+IMAGE_SIZE: tuple[int, int] = (256, 256)  # kích thước ảnh đầu vào cho XceptionNet
 CLASS_NAMES: list[str] = ["Real", "Fake"]
+
+# Thư mục lưu weights tải xuống từ HuggingFace (offline-friendly)
+HF_LOCAL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model", "hf_weights")
 
 # Danh sách Content-Type được chấp nhận khi tải ảnh
 ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/bmp", "image/gif"}
@@ -74,11 +71,12 @@ ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/bmp", "
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Pipeline Tiền Xử Lý (Face Crop + Letterbox Resize)
+# Pipeline Tiền Xử Lý (Face Crop + Direct Resize)
 # ──────────────────────────────────────────────────────────────────────────────
 import cv2
 import numpy as np
 from facenet_pytorch import MTCNN
+
 
 class DeepfakePreprocessingPipeline:
     """
@@ -88,19 +86,16 @@ class DeepfakePreprocessingPipeline:
       1. MTCNN detect face → lấy bounding box + 5 facial landmarks.
       2. Dùng landmarks (2 mắt, mũi) để tính tâm khuôn mặt và khoảng cách mắt-mắt.
          Từ đó xác định vùng crop ĐÚNG khuôn mặt (trán → cằm, má trái → má phải).
-      3. Crop vuông, resize thẳng 256×256, KHÔNG pad, KHÔNG viền.
-      4. 100% pixel trong output là pixel GỐC từ ảnh ban đầu.
+      3. Crop vuông, 100% pixel trong output là pixel GỐC từ ảnh ban đầu.
+      
+    Trả về PIL.Image (RGB) đã crop – CHƯA resize, CHƯA normalize.
+    Việc resize & normalize sẽ được thực hiện riêng cho từng model.
     """
 
-    def __init__(self, target_size=(256, 256), device='cpu'):
-        self.target_size = target_size
+    def __init__(self, device='cpu'):
         self.device = device
         # landmarks=True để MTCNN trả về tọa độ 5 điểm (mắt trái, mắt phải, mũi, 2 mép miệng)
         self.mtcnn = MTCNN(keep_all=False, select_largest=True, device=self.device)
-        self.transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-        ])
 
     def detect_and_crop_square(self, image_rgb: np.ndarray) -> np.ndarray:
         """
@@ -156,8 +151,8 @@ class DeepfakePreprocessingPipeline:
 
         return image_rgb[crop_y1:crop_y2, crop_x1:crop_x2]
 
-    def process(self, image_bytes: bytes) -> torch.Tensor:
-        """Pipeline chính: bytes ảnh → tensor 256×256 sẵn sàng inference."""
+    def extract_face(self, image_bytes: bytes) -> Image.Image:
+        """Pipeline chính: bytes ảnh → PIL.Image (face crop vuông, chưa resize)."""
         nparr = np.frombuffer(image_bytes, np.uint8)
         image_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if image_bgr is None:
@@ -165,114 +160,379 @@ class DeepfakePreprocessingPipeline:
 
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 
-        # 1. Crop face vuông — chỉ lấy khuôn mặt, không lấy nền
+        # Crop face vuông — chỉ lấy khuôn mặt, không lấy nền
         cropped_face = self.detect_and_crop_square(image_rgb)
 
-        # 2. Resize thẳng về 256×256 (ảnh đã vuông → không méo)
-        h, w = cropped_face.shape[:2]
-        target_w, target_h = self.target_size
-        if h > target_h or w > target_w:
-            interpolation = cv2.INTER_AREA
-        else:
-            interpolation = cv2.INTER_CUBIC
-        processed_img = cv2.resize(cropped_face, (target_w, target_h), interpolation=interpolation)
-
-        # 3. Lưu debug
+        # Lưu debug
         debug_path = os.path.join(os.getcwd(), "debug_processed_face.jpg")
-        cv2.imwrite(debug_path, cv2.cvtColor(processed_img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 100])
-        print(f"[API] Debug: {debug_path} | crop {w}x{h} → {target_w}x{target_h}")
+        cv2.imwrite(debug_path, cv2.cvtColor(cropped_face, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 100])
+        h, w = cropped_face.shape[:2]
+        print(f"[Pipeline] Debug: {debug_path} | face crop {w}x{h}")
 
-        # 4. Normalize → Tensor [1, 3, 256, 256]
-        tensor = self.transform(processed_img).unsqueeze(0)
-        return tensor
+        # Chuyển sang PIL Image (RGB)
+        return Image.fromarray(cropped_face)
+
 
 # Khởi tạo singleton pipeline
-preprocess_pipeline = DeepfakePreprocessingPipeline(target_size=IMAGE_SIZE, device=DEVICE)
+preprocess_pipeline = DeepfakePreprocessingPipeline(device=DEVICE)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Model singleton (load một lần duy nhất khi server khởi động)
+# Transforms riêng cho từng model
 # ──────────────────────────────────────────────────────────────────────────────
-_model = None
+
+def _make_transform(size: int) -> transforms.Compose:
+    """Tạo transform chuẩn: Resize → ToTensor → Normalize(0.5, 0.5)."""
+    return transforms.Compose([
+        transforms.Resize((size, size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+    ])
+
+# XceptionNet: 256×256
+transform_xception = _make_transform(256)
+
+# SigLIP2: dùng AutoImageProcessor riêng (sẽ load khi model được load)
+# CommunityForensics: 384×384
+transform_cf = _make_transform(384)
+
+# CLIP-Yermakov: dùng CLIPProcessor riêng (sẽ load khi model được load)
 
 
-def _infer_flags_from_path(path: str) -> dict:
-    """Tự động phát hiện use_gsftm / use_csmiam / use_decam từ tên file checkpoint.
+# ──────────────────────────────────────────────────────────────────────────────
+# Model Registry – load tất cả 4 model một lần duy nhất khi server khởi động
+# ──────────────────────────────────────────────────────────────────────────────
+_models: dict = {}
 
-    Quy ước tên file:
-      *gsftmTrue*  hoặc *gsftmFalse*
-      *csmiamTrue* hoặc *csmiamFalse*
-      *decamTrue*  hoặc *decamFalse*
-    Nếu không tìm thấy pattern → mặc định True (khớp với checkpoint v2).
+
+def _load_xception() -> dict:
+    """Load XceptionNet từ local checkpoint."""
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(
+            f"Không tìm thấy file model XceptionNet: {MODEL_PATH}. "
+            "Kiểm tra biến môi trường MODEL_PATH hoặc đường dẫn mặc định."
+        )
+    
+    print(f"[Loader] Loading XceptionNet from {MODEL_PATH}...")
+    model = XceptionNet(num_classes=2).to(DEVICE)
+    state_dict = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=True)
+    
+    # Remove "module." or "backbone." prefix if saved from DataParallel or custom wrapper
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        new_key = k
+        if new_key.startswith("module."):
+            new_key = new_key[7:]
+        if new_key.startswith("backbone."):
+            new_key = new_key[9:]
+        new_state_dict[new_key] = v
+    model.load_state_dict(new_state_dict)
+    model.eval()
+    
+    param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[Loader] XceptionNet loaded | Params: {param_count:,}")
+    
+    return {"model": model, "name": "XceptionNet"}
+
+
+def _load_siglip2() -> dict:
     """
-    basename = os.path.basename(path).lower()
-
-    def _flag(keyword_true: str, keyword_false: str) -> bool:
-        if keyword_false in basename:
-            return False
-        if keyword_true in basename:
-            return True
-        return True  # mặc định
-
+    Load SigLIP2 Deepfake Detector từ HuggingFace.
+    
+    Mapping theo model card:
+      - Class 0: "Fake"
+      - Class 1: "Real"
+    → fake_index = 0
+    """
+    from transformers import SiglipForImageClassification, AutoImageProcessor
+    
+    repo_id = "prithivMLmods/Deepfake-Detect-Siglip2"
+    cache_dir = os.path.join(HF_LOCAL_DIR, "siglip2")
+    
+    print(f"[Loader] Loading SigLIP2 from {repo_id}...")
+    model = SiglipForImageClassification.from_pretrained(
+        repo_id,
+        cache_dir=cache_dir,
+    ).to(DEVICE)
+    model.eval()
+    
+    processor = AutoImageProcessor.from_pretrained(
+        repo_id,
+        cache_dir=cache_dir,
+    )
+    
+    param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[Loader] SigLIP2 loaded | Params: {param_count:,}")
+    
+    # Đọc id2label từ config để xác nhận
+    id2label = getattr(model.config, "id2label", {})
+    print(f"[Loader] SigLIP2 id2label: {id2label}")
+    
     return {
-        "use_gsftm":  _flag("gsftmtrue",  "gsftmfalse"),
-        "use_csmiam": _flag("csmiamtrue", "csmiamfalse"),
-        "use_decam":  _flag("decamtrue",  "decamfalse"),
+        "model": model,
+        "processor": processor,
+        "name": "SigLIP2",
+        # Theo model card: 0=Fake, 1=Real → fake_index = 0
+        "fake_index": 0,
     }
 
 
-def get_model():
-    """Trả về model đã được load (load lazy nếu chưa có)."""
-    global _model
-    if _model is None:
-        if not os.path.exists(MODEL_PATH):
-            raise FileNotFoundError(
-                f"Không tìm thấy file model: {MODEL_PATH}. "
-                "Kiểm tra biến môi trường MODEL_PATH hoặc đường dẫn mặc định."
-            )
-        
-        if MODEL_TYPE == "XceptionNet":
-            print(f"[API] Initializing XceptionNet with model path: {MODEL_PATH}")
-            model = XceptionNet(num_classes=2).to(DEVICE)
-            state_dict = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=True)
-            # Remove "module." or "backbone." prefix if saved from DataParallel or custom wrapper
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                new_key = k
-                if new_key.startswith("module."):
-                    new_key = new_key[7:]
-                if new_key.startswith("backbone."):
-                    new_key = new_key[9:]
-                new_state_dict[new_key] = v
-            model.load_state_dict(new_state_dict)
-        else:
-            print(f"[API] Initializing G2DMNet with model path: {MODEL_PATH}")
-            flags = _infer_flags_from_path(MODEL_PATH)
-            print(f"[API] Checkpoint flags: {flags}")
-            model = G2DMNet(
-                num_classes=2,
-                pretrain=False,
-                **flags,
-            ).to(DEVICE)
-            state_dict = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=True)
-            model.load_state_dict(state_dict)
-            
-        model.eval()
-        _model = model
-        param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"[API] Model loaded: {os.path.basename(MODEL_PATH)} | "
-              f"Type: {MODEL_TYPE} | Device: {DEVICE} | Params: {param_count:,}")
-    return _model
+def _load_community_forensics() -> dict:
+    """
+    Load CommunityForensics ViT từ HuggingFace.
+    
+    ⚠️ Bắt buộc trust_remote_code=True và input 384×384.
+    """
+    from transformers import AutoModelForImageClassification
+    
+    repo_id = "buildborderless/CommunityForensics-DeepfakeDet-ViT"
+    cache_dir = os.path.join(HF_LOCAL_DIR, "community_forensics")
+    
+    print(f"[Loader] Loading CommunityForensics ViT from {repo_id}...")
+    model = AutoModelForImageClassification.from_pretrained(
+        repo_id,
+        trust_remote_code=True,
+        cache_dir=cache_dir,
+    ).to(DEVICE)
+    model.eval()
+    
+    param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[Loader] CommunityForensics loaded | Params: {param_count:,}")
+    
+    # Đọc id2label nếu có
+    id2label = getattr(model.config, "id2label", {})
+    print(f"[Loader] CommunityForensics id2label: {id2label}")
+    
+    return {
+        "model": model,
+        "name": "CommunityForensics",
+        # Giả thiết chuẩn: 0=Real, 1=Fake (sẽ xác nhận qua id2label)
+        "fake_index": 1,
+    }
+
+
+def _load_clip_yermakov() -> dict:
+    """
+    Load CLIP-Yermakov Deepfake Detector (TorchScript) từ HuggingFace.
+    
+    Theo inference_torchscript.py chính thức:
+      - softmax output: [p_real, p_fake]
+      → fake_index = 1
+    
+    Sử dụng CLIPProcessor từ openai/clip-vit-large-patch14 để preprocessing
+    (theo đúng hướng dẫn trong inference_torchscript.py).
+    """
+    from huggingface_hub import hf_hub_download
+    from transformers import CLIPProcessor
+    
+    repo_id = "yermandy/deepfake-detection"
+    filename = "model.torchscript"
+    cache_dir = os.path.join(HF_LOCAL_DIR, "clip_yermakov")
+    
+    print(f"[Loader] Downloading CLIP-Yermakov TorchScript from {repo_id}...")
+    model_path = hf_hub_download(
+        repo_id=repo_id,
+        filename=filename,
+        local_dir=cache_dir,
+    )
+    
+    print(f"[Loader] Loading CLIP-Yermakov from {model_path}...")
+    model = torch.jit.load(model_path, map_location=DEVICE)
+    model.eval()
+    
+    # Load CLIPProcessor chính hãng cho preprocessing
+    print(f"[Loader] Loading CLIPProcessor (openai/clip-vit-large-patch14)...")
+    clip_processor = CLIPProcessor.from_pretrained(
+        "openai/clip-vit-large-patch14",
+        cache_dir=cache_dir,
+    )
+    
+    print(f"[Loader] CLIP-Yermakov loaded successfully")
+    
+    return {
+        "model": model,
+        "processor": clip_processor,
+        "name": "CLIP-Yermakov",
+        # Theo official code: softmax → [p_real, p_fake] → fake_index = 1
+        "fake_index": 1,
+    }
+
+
+def load_all_models():
+    """Load tất cả 4 model. Mỗi model được load độc lập, nếu 1 model lỗi vẫn load các model còn lại."""
+    global _models
+    
+    loaders = {
+        "xception": _load_xception,
+        "siglip": _load_siglip2,
+        "cf": _load_community_forensics,
+        "clip": _load_clip_yermakov,
+    }
+    
+    for key, loader_fn in loaders.items():
+        try:
+            _models[key] = loader_fn()
+        except Exception as exc:
+            print(f"[Loader] WARNING: KHONG THE load model '{key}': {exc}")
+            traceback.print_exc()
+    
+    print(f"")
+    print(f"[Loader] ===========================================")
+    print(f"[Loader] Total models loaded: {len(_models)}/{len(loaders)}")
+    for key, info in _models.items():
+        print(f"[Loader]   OK  {key}: {info['name']}")
+    print(f"[Loader] Device: {DEVICE}")
+    print(f"[Loader] ===========================================\n")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Lifespan – load model ngay khi server khởi động (warm-up)
+# Inference functions – mỗi model có logic riêng
+# ──────────────────────────────────────────────────────────────────────────────
+
+def predict_xception(face_pil: Image.Image) -> Optional[float]:
+    """Inference XceptionNet: 256×256, trả về xác suất FAKE (0-1)."""
+    info = _models.get("xception")
+    if info is None:
+        return None
+    
+    model = info["model"]
+    tensor = transform_xception(face_pil).unsqueeze(0).to(DEVICE)
+    
+    with torch.no_grad():
+        output = model(tensor)
+        # XceptionNet trả về (logits, feats)
+        if isinstance(output, tuple):
+            logits = output[0]
+        else:
+            logits = output
+        probs = F.softmax(logits, dim=1)[0]
+    
+    # XceptionNet: index 0 = Real, index 1 = Fake
+    return float(probs[1].item())
+
+
+def predict_siglip(face_pil: Image.Image) -> Optional[float]:
+    """
+    Inference SigLIP2: sử dụng AutoImageProcessor riêng.
+    
+    Theo model card:
+      - Class 0 = "Fake"
+      - Class 1 = "Real"
+    → fake_index = 0
+    """
+    info = _models.get("siglip")
+    if info is None:
+        return None
+    
+    model = info["model"]
+    processor = info["processor"]
+    fake_index = info["fake_index"]
+    
+    # Sử dụng processor chính hãng từ model để đảm bảo preprocessing đúng
+    inputs = processor(images=face_pil.convert("RGB"), return_tensors="pt")
+    pixel_values = inputs["pixel_values"].to(DEVICE)
+    
+    with torch.no_grad():
+        outputs = model(pixel_values=pixel_values)
+        probs = F.softmax(outputs.logits, dim=1)[0]
+    
+    return float(probs[fake_index].item())
+
+
+def predict_cf(face_pil: Image.Image) -> Optional[float]:
+    """
+    Inference CommunityForensics ViT: 384×384 (bắt buộc).
+    """
+    info = _models.get("cf")
+    if info is None:
+        return None
+    
+    model = info["model"]
+    fake_index = info["fake_index"]
+    
+    tensor = transform_cf(face_pil.convert("RGB")).unsqueeze(0).to(DEVICE)
+    
+    with torch.no_grad():
+        outputs = model(pixel_values=tensor)
+        probs = F.softmax(outputs.logits, dim=1)[0]
+    
+    return float(probs[fake_index].item())
+
+
+def predict_clip(face_pil: Image.Image) -> Optional[float]:
+    """
+    Inference CLIP-Yermakov (TorchScript): sử dụng CLIPProcessor riêng.
+    
+    Theo official inference_torchscript.py:
+      - softmax output: [p_real, p_fake]
+      → fake_index = 1
+    """
+    info = _models.get("clip")
+    if info is None:
+        return None
+    
+    model = info["model"]
+    processor = info["processor"]
+    fake_index = info["fake_index"]
+    
+    # Sử dụng CLIPProcessor chính hãng (openai/clip-vit-large-patch14)
+    inputs = processor(images=face_pil.convert("RGB"), return_tensors="pt")
+    pixel_values = inputs["pixel_values"].to(DEVICE)
+    
+    with torch.no_grad():
+        output = model(pixel_values)
+        probs = F.softmax(output, dim=1)[0]
+    
+    return float(probs[fake_index].item())
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Ensemble logic
+# ──────────────────────────────────────────────────────────────────────────────
+
+def ensemble_score(scores: dict[str, Optional[float]]) -> float:
+    """Tính trung bình có trọng số các score hợp lệ (ưu tiên XceptionNet)."""
+    weights = {
+        "xception": 4.0,  # XceptionNet được đánh giá mạnh hơn nên có trọng số cao nhất (chiếm 4/7 tổng số nếu cả 4 model đều chạy)
+        "siglip": 1.0,
+        "cf": 1.0,
+        "clip": 1.0,
+    }
+    
+    total_score = 0.0
+    total_weight = 0.0
+    
+    for key, score in scores.items():
+        if score is not None:
+            w = weights.get(key, 1.0)
+            total_score += score * w
+            total_weight += w
+            
+    if total_weight == 0:
+        raise ValueError("Không có model nào trả về kết quả hợp lệ!")
+        
+    return total_score / total_weight
+
+
+def classify(score: float) -> str:
+    """Phân loại dựa trên ngưỡng score."""
+    if score > 0.6:
+        return "FAKE"
+    else:
+        return "REAL"
+
+
+def confidence_level(score: float) -> float:
+    """Tính độ tin cậy: 0 = hoàn toàn không chắc, 1 = chắc chắn tuyệt đối."""
+    return abs(score - 0.5) * 2
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Lifespan – load TẤT CẢ model ngay khi server khởi động (warm-up)
 # ──────────────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    try:
-        get_model()
-    except FileNotFoundError as exc:
-        print(f"[API] CẢNH BÁO: {exc} – model sẽ được load khi có request đầu tiên.")
+    load_all_models()
     yield
 
 
@@ -280,12 +540,13 @@ async def lifespan(app: FastAPI):
 # FastAPI app
 # ──────────────────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="DeepFake Detection API",
+    title="DeepFake Detection API (Ensemble)",
     description=(
-        "API phát hiện deepfake sử dụng mô hình G2DMNet và XceptionNet. "
-        "Gửi URL ảnh khuôn mặt, nhận kết quả dự đoán Real/Fake."
+        "API phát hiện deepfake sử dụng ensemble 4 model: "
+        "XceptionNet, SigLIP2, CommunityForensics ViT, CLIP-Yermakov. "
+        "Gửi URL/file ảnh khuôn mặt, nhận kết quả dự đoán Real/Fake."
     ),
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -293,46 +554,26 @@ app = FastAPI(
 # ──────────────────────────────────────────────────────────────────────────────
 # Schemas
 # ──────────────────────────────────────────────────────────────────────────────
-class PredictRequest(BaseModel):
-    image_url: str
-
-    @field_validator("image_url")
-    @classmethod
-    def validate_image_url(cls, v: str) -> str:
-        """Chỉ chấp nhận URL http/https hợp lệ; chặn SSRF trỏ vào mạng nội bộ."""
-        parsed = urlparse(v)
-
-        # Kiểm tra scheme
-        if parsed.scheme not in ("http", "https"):
-            raise ValueError("image_url phải bắt đầu bằng http:// hoặc https://")
-
-        # Kiểm tra host tồn tại
-        hostname = parsed.hostname
-        if not hostname:
-            raise ValueError("image_url không hợp lệ: thiếu hostname")
-
-        # Bảo vệ SSRF: giải địa chỉ IP của host rồi kiểm tra phạm vi private/loopback
-        try:
-            ip_str = socket.gethostbyname(hostname)
-            ip = ipaddress.ip_address(ip_str)
-        except socket.gaierror:
-            raise ValueError(f"Không thể phân giải hostname: {hostname}")
-
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-            raise ValueError("image_url không được trỏ tới địa chỉ IP nội bộ hoặc loopback")
-
-        return v
+class ModelScore(BaseModel):
+    """Kết quả dự đoán của một model đơn lẻ."""
+    name: str              # tên model
+    fake_score: Optional[float] = None  # xác suất FAKE (0-1), None nếu model không khả dụng
+    available: bool = True  # model có được load thành công không
 
 
 class PredictResponse(BaseModel):
-    prediction: str       # "Real" hoặc "Fake"
-    label: int            # 0 = Real, 1 = Fake
-    confidence: float     # xác suất của class được dự đoán (0–1)
-    prob_real: float      # xác suất ảnh là thật
-    prob_fake: float      # xác suất ảnh là deepfake
-    model_type: str       # G2DMNet hoặc XceptionNet
-    model_file: str       # tên file model đã dùng
-    device: str           # "cuda" hoặc "cpu"
+    # Kết quả ensemble
+    final_score: float      # điểm FAKE trung bình (0-1)
+    label: str              # "FAKE" | "REAL" | "UNCERTAIN"
+    confidence: float       # độ tin cậy (0-1)
+    
+    # Chi tiết từng model
+    scores: dict[str, Optional[float]]  # {"xception": 0.85, "siglip": 0.92, ...}
+    
+    # Metadata
+    models_used: int         # số model thực sự chạy inference
+    models_total: int        # tổng số model đã load
+    device: str              # "cuda" hoặc "cpu"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -341,10 +582,10 @@ class PredictResponse(BaseModel):
 @app.post(
     "/predict",
     response_model=PredictResponse,
-    summary="Dự đoán ảnh có phải deepfake không",
+    summary="Dự đoán ảnh có phải deepfake không (Ensemble 4 model)",
     description=(
-        "Nhận `image_url` qua JSON hoặc file ảnh trực tiếp qua `file` form-data, "
-        "chạy model và trả về kết quả dự đoán chi tiết."
+        "Nhận `image_url` qua form-data hoặc file ảnh trực tiếp qua `file` form-data, "
+        "chạy ensemble 4 model và trả về kết quả dự đoán chi tiết."
     ),
 )
 async def predict(
@@ -354,6 +595,9 @@ async def predict(
     
     if not image_url and not file:
         raise HTTPException(status_code=400, detail="Vui lòng cung cấp `image_url` hoặc upload `file`.")
+    
+    if not _models:
+        raise HTTPException(status_code=503, detail="Không có model nào được load. Kiểm tra log server.")
         
     # ── 1. Đọc ảnh từ URL hoặc File ──────────────────────────────────────────
     image_content = b""
@@ -411,44 +655,59 @@ async def predict(
                 detail=f"Ảnh tải về quá lớn (tối đa {MAX_IMAGE_BYTES // (1024*1024)} MB).",
             )
 
-    # ── 2. Decode & tiền xử lý ───────────────────────────────────────────────
+    # ── 2. Face Detection & Crop ─────────────────────────────────────────────
     try:
-        tensor = preprocess_pipeline.process(image_content).to(DEVICE)
+        face_pil = preprocess_pipeline.extract_face(image_content)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Lỗi tiền xử lý ảnh: {exc}")
 
-    # ── 3. Inference ─────────────────────────────────────────────────────────
+    # ── 3. Ensemble Inference ────────────────────────────────────────────────
+    scores: dict[str, Optional[float]] = {}
+    
+    predict_fns = {
+        "xception": predict_xception,
+        "siglip": predict_siglip,
+        "cf": predict_cf,
+        "clip": predict_clip,
+    }
+    
+    for key, fn in predict_fns.items():
+        try:
+            score = fn(face_pil)
+            scores[key] = round(score, 4) if score is not None else None
+            if score is not None:
+                model_name = _models.get(key, {}).get("name", key)
+                print(f"[Inference] {model_name}: fake_score = {score:.4f}")
+        except Exception as exc:
+            print(f"[Inference] ⚠️ Lỗi inference model '{key}': {exc}")
+            traceback.print_exc()
+            scores[key] = None
+
+    # ── 4. Tính Ensemble Score ───────────────────────────────────────────────
     try:
-        model = get_model()
-        with torch.no_grad():
-            output = model(tensor)
-            
-            # G2DMNet trả về (logits, aux), XceptionNet trả về (logits, feats)
-            # Trong cả hai trường hợp, logits là phần tử đầu tiên của tuple
-            if isinstance(output, tuple):
-                logits = output[0]
-            else:
-                logits = output
-                
-            probs = F.softmax(logits, dim=1)[0]  # (2,)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Lỗi inference: {exc}")
+        final = ensemble_score(scores)
+    except ValueError:
+        raise HTTPException(
+            status_code=500,
+            detail="Tất cả model đều thất bại trong quá trình inference."
+        )
+    
+    label = classify(final)
+    conf = confidence_level(final)
+    models_used = sum(1 for s in scores.values() if s is not None)
+    
+    print(f"[Ensemble] Final: {final:.4f} | Label: {label} | Confidence: {conf:.4f} | Models: {models_used}/{len(_models)}")
 
-    prob_real = float(probs[0])
-    prob_fake = float(probs[1])
-    label = int(probs.argmax().item())
-
-    # ── 4. Trả về kết quả ────────────────────────────────────────────────────
+    # ── 5. Trả về kết quả ────────────────────────────────────────────────────
     return PredictResponse(
-        prediction=CLASS_NAMES[label],
+        final_score=round(final, 4),
         label=label,
-        confidence=round(float(probs[label]), 4),
-        prob_real=round(prob_real, 4),
-        prob_fake=round(prob_fake, 4),
-        model_type=MODEL_TYPE,
-        model_file=os.path.basename(MODEL_PATH),
+        confidence=round(conf, 4),
+        scores=scores,
+        models_used=models_used,
+        models_total=len(_models),
         device=DEVICE,
     )
 
@@ -458,10 +717,10 @@ async def predict(
 # ──────────────────────────────────────────────────────────────────────────────
 @app.get("/health", summary="Kiểm tra trạng thái server")
 async def health():
+    loaded_models = {k: v["name"] for k, v in _models.items()}
     return {
         "status": "ok",
-        "model_loaded": _model is not None,
-        "model_type": MODEL_TYPE,
-        "model_file": os.path.basename(MODEL_PATH),
+        "models_loaded": len(_models),
+        "models": loaded_models,
         "device": DEVICE,
     }

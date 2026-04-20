@@ -6,8 +6,17 @@ torchvision>=0.15.0
 numpy>=1.24.0
 tqdm>=4.65.0
 
-# Data Processing
+# HuggingFace Transformers & Hub
+transformers>=4.40.0
+huggingface_hub>=0.23.0
+timm>=0.9.0
+
+# Face Detection
+facenet-pytorch>=2.5.3
+
+# Image Processing
 Pillow>=9.5.0
+opencv-python>=4.8.0
 
 # API Backend
 fastapi>=0.111.0

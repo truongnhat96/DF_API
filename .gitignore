@@ -70,7 +70,7 @@ venv.bak/
 .DS_Store
 Thumbs.db
 
-# Model files
+# Model
 *.h5
 *.pkl
 *.pth
