@@ -353,8 +353,7 @@ def _load_clip_yermakov() -> dict:
         "model": model,
         "processor": clip_processor,
         "name": "CLIP-Yermakov",
-        # Theo official code: softmax → [p_real, p_fake] → fake_index = 1
-        "fake_index": 1,
+        "fake_index": 0,
     }
 
 
@@ -487,44 +486,131 @@ def predict_clip(face_pil: Image.Image) -> Optional[float]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Ensemble logic
+# Ensemble logic – Khối quyết định theo thứ tự ưu tiên
 # ──────────────────────────────────────────────────────────────────────────────
 
-def ensemble_score(scores: dict[str, Optional[float]]) -> float:
-    """Tính trung bình có trọng số các score hợp lệ (ưu tiên XceptionNet)."""
-    weights = {
-        "xception": 4.0,  # XceptionNet được đánh giá mạnh hơn nên có trọng số cao nhất (chiếm 4/7 tổng số nếu cả 4 model đều chạy)
-        "siglip": 1.0,
-        "cf": 1.0,
-        "clip": 1.0,
-    }
+def priority_based_decision(scores: dict[str, Optional[float]]) -> dict:
+    """
+    Hệ thống ra quyết định theo mức độ ưu tiên cụ thể trên từng model:
+    Chỉ kết luận FAKE khi:
+      - Xception có fake_score >= 0.65 ĐỒNG THỜI CF và CLIP > 0.75
+      - HOẶC Xception > 0.90 ĐỒNG THỜI 1 trong 2 model (CF, CLIP) > 0.85
+    Chỉ kết luận REAL khi:
+      - Xception < 0.65 VÀ SigLIP dự đoán REAL
+      - HOẶC (CF < 0.75 HOẶC CLIP < 0.75) VÀ SigLIP dự đoán REAL
+    Ngoại lệ: So sánh fake_strength và real_confidence. Nếu bằng nhau, trả về UNCERTAIN và log forced output.
+    """
+    x = scores.get("xception")
+    s = scores.get("siglip")
+    c = scores.get("cf")
+    l = scores.get("clip")
     
-    total_score = 0.0
-    total_weight = 0.0
-    
-    for key, score in scores.items():
-        if score is not None:
-            w = weights.get(key, 1.0)
-            total_score += score * w
-            total_weight += w
+    # Tính fake_strength (đóng vai trò chỉ số hỗ trợ show response)
+    weights = {'xception': 0.60, 'siglip': 0.20, 'cf': 0.10, 'clip': 0.10}
+    strength_num = sum((scores[k] * weights[k]) for k in weights if scores.get(k) is not None)
+    strength_den = sum(weights[k] for k in weights if scores.get(k) is not None)
+    fake_strength = (strength_num / strength_den) if strength_den > 0 else 0.0
+
+    r = (1.0 - s) if s is not None else 0.5
+    real_confidence = r
+
+    siglip_real = (s is not None and s < 0.50) # Tức là dự đoán REAL
+
+    is_fake = False
+    is_real = False
+    reason = ""
+
+    # ── Điều kiện FAKE ──
+    # C1: x >= 0.65 AND c > 0.75 AND l > 0.75
+    cond_fake_1 = (x is not None and x >= 0.65) and (c is not None and c > 0.75) and (l is not None and l > 0.75)
+    # C2: x > 0.90 AND (c > 0.85 OR l > 0.85)
+    cond_fake_2 = (x is not None and x > 0.90) and ((c is not None and c > 0.8) or (l is not None and l > 0.8))
+
+    if cond_fake_1 or cond_fake_2:
+        is_fake = True
+        if cond_fake_1:
+            reason = "FAKE: x >= 0.65 đồng thời c > 0.75 và l > 0.75"
+        else:
+            reason = "FAKE: x > 0.90 và (c > 0.85 hoặc l > 0.85)"
+
+    # ── Điều kiện REAL ──
+    # C1: x < 0.65 AND siglip_real
+    cond_real_1 = (x is not None and x < 0.65) and siglip_real
+    # C2: (c < 0.75 OR l < 0.75) AND siglip_real
+    cond_real_2 = ((c is not None and c < 0.75) or (l is not None and l < 0.75)) and siglip_real
+
+    if not is_fake and (cond_real_1 or cond_real_2):
+        is_real = True
+        if cond_real_1:
+            reason = "REAL: x < 0.65 và siglip chọn REAL"
+        else:
+            reason = "REAL: (c < 0.75 hoặc l < 0.75) và siglip chọn REAL"
             
-    if total_weight == 0:
-        raise ValueError("Không có model nào trả về kết quả hợp lệ!")
-        
-    return total_score / total_weight
-
-
-def classify(score: float) -> str:
-    """Phân loại dựa trên ngưỡng score."""
-    if score > 0.6:
-        return "FAKE"
+    # ── Quyết định ──
+    if is_fake:
+        label = "FAKE"
+        if cond_fake_1:
+            # Dựa vào x, c, l
+            values = [v for v in [x, c, l] if v is not None]
+            confidence = sum(values) / len(values) if values else fake_strength
+        else:
+            # cond_fake_2: x và (1 trong 2 CF, CLIP)
+            values = [x]
+            max_other = max([v for v in [c, l] if v is not None], default=None)
+            if max_other is not None:
+                values.append(max_other)
+            confidence = sum(values) / len(values) if values else fake_strength
+            
+    elif is_real:
+        label = "REAL"
+        if cond_real_1:
+            # Dựa vào x và siglip real (s)
+            values = [(1.0 - v) for v in [x, s] if v is not None]
+            confidence = sum(values) / len(values) if values else real_confidence
+        else:
+            # cond_real_2: siglip real (s) và (1 trong 2 CF, CLIP)
+            values = [1.0 - s] if s is not None else []
+            min_other = min([v for v in [c, l] if v is not None], default=None)
+            if min_other is not None:
+                values.append(1.0 - min_other)
+            confidence = sum(values) / len(values) if values else real_confidence
+            
     else:
-        return "REAL"
+        # Fallback
+        if fake_strength > real_confidence:
+            label = "FAKE"
+            reason = f"Fallback FAKE: fake_strength ({fake_strength:.4f}) > real_confidence ({real_confidence:.4f})"
+            confidence = fake_strength
+        elif real_confidence > fake_strength:
+            label = "REAL"
+            reason = f"Fallback REAL: real_confidence ({real_confidence:.4f}) > fake_strength ({fake_strength:.4f})"
+            confidence = real_confidence
+        else:
+            label = "UNCERTAIN"
+            reason = (f"Tie break ({fake_strength:.4f} == {real_confidence:.4f}): "
+                      f"x={x}, s={s}, c={c}, l={l}. "
+                      f"-> Forced output: [REAL, FAKE] (Equal)")
+            confidence = 0.0
 
+    # Tính fake_votes hỗ trợ hiển thị
+    THRESHOLD_XCEPTION = 0.65
+    THRESHOLD_SIGLIP   = 0.50
+    THRESHOLD_CF       = 0.60
+    THRESHOLD_CLIP     = 0.60
+    x_fake = (x >= THRESHOLD_XCEPTION) if x is not None else False
+    s_fake = (s >= THRESHOLD_SIGLIP) if s is not None else False
+    c_fake = (c >= THRESHOLD_CF) if c is not None else False
+    l_fake = (l >= THRESHOLD_CLIP) if l is not None else False
+    fake_votes = sum([x_fake, s_fake, c_fake, l_fake])
 
-def confidence_level(score: float) -> float:
-    """Tính độ tin cậy: 0 = hoàn toàn không chắc, 1 = chắc chắn tuyệt đối."""
-    return abs(score - 0.5) * 2
+    return {
+        "label": label,
+        "fake_strength": round(fake_strength, 4),
+        "real_confidence": round(real_confidence, 4),
+        "fake_votes": fake_votes,
+        "confidence": round(confidence, 4),
+        "reason": reason,
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -562,13 +648,16 @@ class ModelScore(BaseModel):
 
 
 class PredictResponse(BaseModel):
-    # Kết quả ensemble
-    final_score: float      # điểm FAKE trung bình (0-1)
+    # Kết quả quyết định Priority-based
     label: str              # "FAKE" | "REAL" | "UNCERTAIN"
     confidence: float       # độ tin cậy (0-1)
+    fake_strength: float    # sức mạnh tín hiệu FAKE tổng hợp (weighted: 60% xception, 20% siglip, 10% cf, 10% clip)
+    real_confidence: float  # SigLIP2 real confidence (1 - siglip_fake_score)
+    fake_votes: int         # số fake detector vượt ngưỡng (0-4)
+    reason: str             # giải thích lý do ra quyết định
     
-    # Chi tiết từng model
-    scores: dict[str, Optional[float]]  # {"xception": 0.85, "siglip": 0.92, ...}
+    # Chi tiết từng model (fake_score: 0-1)
+    scores: dict[str, Optional[float]]  # {"xception": 0.85, "siglip": 0.02, "cf": 0.78, "clip": 0.71}
     
     # Metadata
     models_used: int         # số model thực sự chạy inference
@@ -685,26 +774,33 @@ async def predict(
             traceback.print_exc()
             scores[key] = None
 
-    # ── 4. Tính Ensemble Score ───────────────────────────────────────────────
-    try:
-        final = ensemble_score(scores)
-    except ValueError:
-        raise HTTPException(
-            status_code=500,
-            detail="Tất cả model đều thất bại trong quá trình inference."
-        )
-    
-    label = classify(final)
-    conf = confidence_level(final)
+    # ── 4. Quyết định Priority-based ─────────────────────────────────────────────────
     models_used = sum(1 for s in scores.values() if s is not None)
     
-    print(f"[Ensemble] Final: {final:.4f} | Label: {label} | Confidence: {conf:.4f} | Models: {models_used}/{len(_models)}")
+    if models_used == 0:
+        raise HTTPException(
+            status_code=500,
+            detail="Tat ca model deu that bai trong qua trinh inference."
+        )
+    
+    decision = priority_based_decision(scores)
+    
+    print(f"[Decision] Label: {decision['label']} | "
+          f"Fake votes: {decision['fake_votes']}/4 | "
+          f"Fake strength: {decision['fake_strength']:.4f} | "
+          f"SigLIP2 real: {decision['real_confidence']:.4f} | "
+          f"Confidence: {decision['confidence']:.4f} | "
+          f"Reason: {decision['reason']} | "
+          f"Models: {models_used}/{len(_models)}")
 
     # ── 5. Trả về kết quả ────────────────────────────────────────────────────
     return PredictResponse(
-        final_score=round(final, 4),
-        label=label,
-        confidence=round(conf, 4),
+        label=decision["label"],
+        confidence=decision["confidence"],
+        fake_strength=decision["fake_strength"],
+        real_confidence=decision["real_confidence"],
+        fake_votes=decision["fake_votes"],
+        reason=decision["reason"],
         scores=scores,
         models_used=models_used,
         models_total=len(_models),
