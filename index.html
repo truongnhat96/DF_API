@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+	<meta charset="UTF-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+	<title>Deepfake Detection</title>
+	<style>
+		:root {
+			--bg-1: #f4f7ff;
+			--bg-2: #eef9f1;
+			--card: #ffffff;
+			--text: #1a2538;
+			--muted: #5f6c80;
+			--accent: #0c7a43;
+			--accent-strong: #095a32;
+			--danger: #c0392b;
+			--danger-soft: #fdecec;
+			--safe: #0c7a43;
+			--safe-soft: #eaf8ef;
+			--warn: #b26a00;
+			--warn-soft: #fff6e8;
+			--border: #dce3ee;
+			--shadow: 0 12px 28px rgba(18, 35, 72, 0.12);
+		}
+
+		* {
+			box-sizing: border-box;
+		}
+
+		body {
+			margin: 0;
+			min-height: 100vh;
+			font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+			color: var(--text);
+			background:
+				radial-gradient(circle at 10% 10%, #dff2ff 0%, transparent 35%),
+				radial-gradient(circle at 90% 20%, #daf6e3 0%, transparent 38%),
+				linear-gradient(135deg, var(--bg-1), var(--bg-2));
+			display: grid;
+			place-items: center;
+			padding: 20px;
+		}
+
+		.app {
+			width: 100%;
+			max-width: 780px;
+			background: var(--card);
+			border: 1px solid var(--border);
+			border-radius: 20px;
+			box-shadow: var(--shadow);
+			overflow: hidden;
+			animation: rise 0.6s ease-out;
+		}
+
+		@keyframes rise {
+			from {
+				opacity: 0;
+				transform: translateY(16px);
+			}
+			to {
+				opacity: 1;
+				transform: translateY(0);
+			}
+		}
+
+		.header {
+			padding: 28px 28px 12px;
+			border-bottom: 1px solid var(--border);
+			background: linear-gradient(135deg, #f8fbff, #f6fff9);
+		}
+
+		.title {
+			margin: 0;
+			font-size: clamp(1.35rem, 2.6vw, 1.9rem);
+			font-weight: 700;
+			letter-spacing: 0.2px;
+		}
+
+		.subtitle {
+			margin: 10px 0 0;
+			color: var(--muted);
+			font-size: 0.98rem;
+			line-height: 1.45;
+		}
+
+		.content {
+			padding: 22px 28px 28px;
+			display: grid;
+			gap: 18px;
+		}
+
+		.field {
+			display: grid;
+			gap: 8px;
+		}
+
+		label {
+			font-weight: 600;
+			font-size: 0.95rem;
+		}
+
+		input[type="text"],
+		input[type="file"] {
+			width: 100%;
+			border: 1px solid #cfd9e9;
+			border-radius: 12px;
+			padding: 12px 14px;
+			font-size: 0.96rem;
+			outline: none;
+			transition: border-color 0.2s ease, box-shadow 0.2s ease;
+			background: #fff;
+		}
+
+		input[type="text"]:focus,
+		input[type="file"]:focus {
+			border-color: #5ca5ff;
+			box-shadow: 0 0 0 3px rgba(92, 165, 255, 0.18);
+		}
+
+		.preview {
+			width: min(100%, 340px);
+			aspect-ratio: 1 / 1;
+			border: 1px dashed #b9c7de;
+			border-radius: 14px;
+			background: #fbfdff;
+			display: grid;
+			place-items: center;
+			overflow: hidden;
+		}
+
+		.preview img {
+			width: 100%;
+			height: 100%;
+			object-fit: cover;
+			display: none;
+		}
+
+		.preview-text {
+			color: #76869f;
+			font-size: 0.92rem;
+			text-align: center;
+			padding: 10px;
+		}
+
+		.actions {
+			display: flex;
+			align-items: center;
+			gap: 12px;
+			flex-wrap: wrap;
+		}
+
+		.btn {
+			border: none;
+			border-radius: 12px;
+			padding: 12px 20px;
+			background: linear-gradient(135deg, var(--accent), #17a45e);
+			color: #fff;
+			font-weight: 700;
+			font-size: 0.96rem;
+			cursor: pointer;
+			transition: transform 0.12s ease, filter 0.2s ease;
+		}
+
+		.btn:hover {
+			filter: brightness(1.05);
+		}
+
+		.btn:active {
+			transform: translateY(1px);
+		}
+
+		.btn[disabled] {
+			cursor: not-allowed;
+			opacity: 0.7;
+		}
+
+		.status {
+			color: var(--muted);
+			font-size: 0.93rem;
+			min-height: 1.2em;
+		}
+
+		.status.error {
+			color: var(--danger);
+			font-weight: 600;
+		}
+
+		.result {
+			border: 1px solid var(--border);
+			border-radius: 14px;
+			background: #f9fbff;
+			padding: 14px;
+			display: grid;
+			gap: 10px;
+		}
+
+		.badge {
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			padding: 6px 12px;
+			border-radius: 999px;
+			font-weight: 800;
+			font-size: 0.88rem;
+			letter-spacing: 0.3px;
+			border: 1px solid transparent;
+		}
+
+		.badge.real {
+			background: var(--safe-soft);
+			color: var(--safe);
+			border-color: #bde6cc;
+		}
+
+		.badge.fake {
+			background: var(--danger-soft);
+			color: var(--danger);
+			border-color: #f5bebe;
+		}
+
+		.badge.uncertain {
+			background: var(--warn-soft);
+			color: var(--warn);
+			border-color: #ffd99c;
+		}
+
+		.confidence-block {
+			display: grid;
+			gap: 8px;
+		}
+
+		.confidence-track {
+			width: 100%;
+			height: 10px;
+			background: #e6ecf7;
+			border-radius: 999px;
+			overflow: hidden;
+		}
+
+		.confidence-fill {
+			height: 100%;
+			width: 0%;
+			background: linear-gradient(90deg, #2d9b5f, #1f7fbd);
+			transition: width 0.35s ease;
+		}
+
+		.hint {
+			color: var(--muted);
+			font-size: 0.9rem;
+		}
+
+		.row {
+			display: flex;
+			justify-content: space-between;
+			align-items: center;
+			gap: 16px;
+			padding-bottom: 8px;
+			border-bottom: 1px dashed #d8e0ef;
+		}
+
+		.row:last-child {
+			border-bottom: none;
+			padding-bottom: 0;
+		}
+
+		.k {
+			color: var(--muted);
+			font-weight: 600;
+		}
+
+		.v {
+			font-weight: 800;
+			letter-spacing: 0.2px;
+			font-size: 1.02rem;
+		}
+
+		@media (max-width: 560px) {
+			.header,
+			.content {
+				padding-left: 16px;
+				padding-right: 16px;
+			}
+
+			.row {
+				flex-direction: column;
+				align-items: flex-start;
+				gap: 4px;
+			}
+		}
+	</style>
+</head>
+<body>
+	<main class="app">
+		<section class="header">
+			<h1 class="title">Deepfake Detection</h1>
+			<p class="subtitle">
+				Upload ảnh khuôn mặt để gọi API dự đoán deepfake.
+				Kết quả chỉ hiển thị: Label và Confidence (%).
+			</p>
+		</section>
+
+		<section class="content">
+			<div class="field">
+				<label for="apiUrl">API URL</label>
+				<input id="apiUrl" type="text" value="http://127.0.0.1:8000/predict" />
+			</div>
+
+			<div class="field">
+				<label for="imageFile">Chọn ảnh</label>
+				<input id="imageFile" type="file" accept="image/*" />
+			</div>
+
+			<div class="preview" id="previewBox">
+				<img id="previewImage" alt="Preview" />
+				<div class="preview-text" id="previewText">Chưa có ảnh được chọn</div>
+			</div>
+
+			<div class="actions">
+				<button id="predictBtn" class="btn" type="button">Dự đoán</button>
+				<span id="status" class="status"></span>
+			</div>
+
+			<div class="result">
+				<div class="row">
+					<span class="k">Nhãn dự đoán</span>
+					<span id="labelValue" class="badge uncertain">Chưa có</span>
+				</div>
+				<div class="row">
+					<span class="k">Độ tin cậy</span>
+					<span id="confidenceValue" class="v">-</span>
+				</div>
+				<div class="confidence-block">
+					<div class="confidence-track">
+						<div id="confidenceFill" class="confidence-fill"></div>
+					</div>
+					<div id="resultHint" class="hint">Kết quả sẽ hiển thị sau khi dự đoán.</div>
+				</div>
+			</div>
+		</section>
+	</main>
+
+	<script>
+		const imageInput = document.getElementById("imageFile");
+		const previewImage = document.getElementById("previewImage");
+		const previewText = document.getElementById("previewText");
+		const predictBtn = document.getElementById("predictBtn");
+		const statusEl = document.getElementById("status");
+		const apiUrlInput = document.getElementById("apiUrl");
+
+		const labelValue = document.getElementById("labelValue");
+		const confidenceValue = document.getElementById("confidenceValue");
+		const confidenceFill = document.getElementById("confidenceFill");
+		const resultHint = document.getElementById("resultHint");
+
+		imageInput.addEventListener("change", () => {
+			const file = imageInput.files && imageInput.files[0];
+
+			if (!file) {
+				previewImage.style.display = "none";
+				previewImage.src = "";
+				previewText.style.display = "block";
+				previewText.textContent = "Chưa có ảnh được chọn";
+				return;
+			}
+
+			const objectUrl = URL.createObjectURL(file);
+			previewImage.src = objectUrl;
+			previewImage.style.display = "block";
+			previewText.style.display = "none";
+		});
+
+		function setStatus(message, isError = false) {
+			statusEl.textContent = message;
+			statusEl.classList.toggle("error", isError);
+		}
+
+		function formatConfidenceToPercent(value) {
+			const num = Number(value);
+			if (!Number.isFinite(num)) return "-";
+			const clamped = Math.max(0, Math.min(1, num));
+			return `${(clamped * 100).toFixed(2)}%`;
+		}
+
+		function normalizeLabel(rawLabel) {
+			const label = String(rawLabel || "").trim().toUpperCase();
+			if (label === "REAL") return "REAL";
+			if (label === "FAKE") return "FAKE";
+			return "UNCERTAIN";
+		}
+
+		function renderLabelVietnamese(label) {
+			if (label === "REAL") return "THẬT (REAL)";
+			if (label === "FAKE") return "GIẢ MẠO (FAKE)";
+			return "CHƯA CHẮC CHẮN";
+		}
+
+		function getHintText(label, score01) {
+			const pct = Number.isFinite(score01) ? (score01 * 100) : 0;
+			if (label === "FAKE") {
+				return `Ảnh có dấu hiệu giả mạo với độ tin cậy ${pct.toFixed(2)}%.`;
+			}
+			if (label === "REAL") {
+				return `Ảnh có xu hướng là thật với độ tin cậy ${pct.toFixed(2)}%.`;
+			}
+			return "Kết quả chưa đủ chắc chắn, nên kiểm tra thêm bằng nguồn khác.";
+		}
+
+		function renderResult(rawLabel, rawConfidence) {
+			const label = normalizeLabel(rawLabel);
+			const score = Number(rawConfidence);
+			const clamped = Number.isFinite(score) ? Math.max(0, Math.min(1, score)) : 0;
+
+			labelValue.classList.remove("real", "fake", "uncertain");
+			if (label === "REAL") labelValue.classList.add("real");
+			else if (label === "FAKE") labelValue.classList.add("fake");
+			else labelValue.classList.add("uncertain");
+
+			labelValue.textContent = renderLabelVietnamese(label);
+			confidenceValue.textContent = formatConfidenceToPercent(clamped);
+			confidenceFill.style.width = `${(clamped * 100).toFixed(2)}%`;
+			resultHint.textContent = getHintText(label, clamped);
+		}
+
+		function resetResult() {
+			labelValue.classList.remove("real", "fake");
+			labelValue.classList.add("uncertain");
+			labelValue.textContent = "Chưa có";
+			confidenceValue.textContent = "-";
+			confidenceFill.style.width = "0%";
+			resultHint.textContent = "Kết quả sẽ hiển thị sau khi dự đoán.";
+		}
+
+		predictBtn.addEventListener("click", async () => {
+			const file = imageInput.files && imageInput.files[0];
+			const apiUrl = apiUrlInput.value.trim();
+
+			if (!file) {
+				setStatus("Vui lòng chọn ảnh trước khi dự đoán.", true);
+				return;
+			}
+
+			if (!apiUrl) {
+				setStatus("Vui lòng nhập API URL.", true);
+				return;
+			}
+
+			const formData = new FormData();
+			formData.append("file", file);
+
+			setStatus("Đang gửi ảnh và dự đoán...");
+			predictBtn.disabled = true;
+
+			try {
+				const response = await fetch(apiUrl, {
+					method: "POST",
+					body: formData,
+				});
+
+				let data = null;
+				try {
+					data = await response.json();
+				} catch (_) {
+					data = null;
+				}
+
+				if (!response.ok) {
+					const detail = data && data.detail ? data.detail : `HTTP ${response.status}`;
+					throw new Error(detail);
+				}
+
+				// Linh hoạt với cả key thường và key viết hoa
+				const label = data ? (data.label ?? data.Label) : null;
+				const confidence = data ? (data.confidence ?? data.Confidence) : null;
+
+				renderResult(label, confidence);
+
+				setStatus("Dự đoán thành công.");
+			} catch (error) {
+				resetResult();
+				setStatus(`Lỗi: ${error.message || "Không thể gọi API."}`, true);
+			} finally {
+				predictBtn.disabled = false;
+			}
+		});
+	</script>
+</body>
+</html>

@@ -39,6 +39,7 @@ import httpx
 import torch
 import torch.nn.functional as F
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form
+from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from pydantic import BaseModel, field_validator
 from torchvision import transforms
@@ -69,6 +70,9 @@ ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/bmp", "
 
 # Giới hạn kích thước file ảnh: 20 MB
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
+
+# Lưu ảnh debug sau tiền xử lý (mặc định tắt để tránh trigger auto-reload của frontend dev server)
+SAVE_DEBUG_FACE = os.environ.get("SAVE_DEBUG_FACE", "0") == "1"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Pipeline Tiền Xử Lý (Face Crop + Direct Resize)
@@ -163,11 +167,13 @@ class DeepfakePreprocessingPipeline:
         # Crop face vuông — chỉ lấy khuôn mặt, không lấy nền
         cropped_face = self.detect_and_crop_square(image_rgb)
 
-        # Lưu debug
-        debug_path = os.path.join(os.getcwd(), "debug_processed_face.jpg")
-        cv2.imwrite(debug_path, cv2.cvtColor(cropped_face, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 100])
         h, w = cropped_face.shape[:2]
-        print(f"[Pipeline] Debug: {debug_path} | face crop {w}x{h}")
+        if SAVE_DEBUG_FACE:
+            debug_path = os.path.join(os.getcwd(), "debug_processed_face.jpg")
+            cv2.imwrite(debug_path, cv2.cvtColor(cropped_face, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 100])
+            print(f"[Pipeline] Debug: {debug_path} | face crop {w}x{h}")
+        else:
+            print(f"[Pipeline] Face crop size: {w}x{h}")
 
         # Chuyển sang PIL Image (RGB)
         return Image.fromarray(cropped_face)
@@ -253,12 +259,14 @@ def _load_siglip2() -> dict:
     model = SiglipForImageClassification.from_pretrained(
         repo_id,
         cache_dir=cache_dir,
+        local_files_only=True,
     ).to(DEVICE)
     model.eval()
     
     processor = AutoImageProcessor.from_pretrained(
         repo_id,
         cache_dir=cache_dir,
+        local_files_only=True,
     )
     
     param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -293,6 +301,7 @@ def _load_community_forensics() -> dict:
         repo_id,
         trust_remote_code=True,
         cache_dir=cache_dir,
+        local_files_only=True,
     ).to(DEVICE)
     model.eval()
     
@@ -329,11 +338,12 @@ def _load_clip_yermakov() -> dict:
     filename = "model.torchscript"
     cache_dir = os.path.join(HF_LOCAL_DIR, "clip_yermakov")
     
-    print(f"[Loader] Downloading CLIP-Yermakov TorchScript from {repo_id}...")
+    print(f"[Loader] Checking local cache for CLIP-Yermakov TorchScript from {repo_id}...")
     model_path = hf_hub_download(
         repo_id=repo_id,
         filename=filename,
         local_dir=cache_dir,
+        local_files_only=True,
     )
     
     print(f"[Loader] Loading CLIP-Yermakov from {model_path}...")
@@ -345,6 +355,7 @@ def _load_clip_yermakov() -> dict:
     clip_processor = CLIPProcessor.from_pretrained(
         "openai/clip-vit-large-patch14",
         cache_dir=cache_dir,
+        local_files_only=True,
     )
     
     print(f"[Loader] CLIP-Yermakov loaded successfully")
@@ -634,6 +645,15 @@ app = FastAPI(
     ),
     version="2.0.0",
     lifespan=lifespan,
+)
+
+# Cho phep frontend goi API tu origin khac (file://, localhost khac port, v.v.)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
